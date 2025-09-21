@@ -448,7 +448,7 @@ elif page.startswith('2'):
             st.subheader(promo)
             if df_ev.empty:
                 st.info('Aucune séance pour cette matière.')
-                else:
+            else:
                 st.dataframe(df_ev.sort_values('start').reset_index(drop=True))
 
 # ---------- Page 3 ----------
