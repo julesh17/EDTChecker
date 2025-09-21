@@ -1,13 +1,10 @@
-# edt_reports_streamlit.py
 import streamlit as st
 import pandas as pd
 import re
-import uuid
 from datetime import datetime, date, time
 from dateutil import parser as dtparser
-import pytz
 
-# ---------------- Utilities (same robust parser as before) ----------------
+# ---------------- Utilities ----------------
 
 def normalize_group_label(x):
     if x is None:
@@ -100,12 +97,6 @@ def find_slot_rows(df):
     return rows
 
 def parse_sheet_to_events(xls, sheet_name):
-    """
-    Retourne une liste d'événements structurés extraits d'une feuille (header=None).
-    Chaque élément : {
-      'summary', 'teachers' (list), 'description' (str), 'start' (datetime), 'end', 'groups' (list)
-    }
-    """
     df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
     nrows, ncols = df.shape
 
@@ -138,17 +129,21 @@ def parse_sheet_to_events(xls, sheet_name):
                 if not summary_str:
                     continue
 
-                # teacher
-                teacher = None
+                # collect teachers (multiple)
+                teachers = []
                 if (r + 2) < nrows:
-                    try:
-                        t = df.iat[r + 2, col]
-                        if not pd.isna(t):
-                            teacher = str(t).strip()
-                    except Exception:
-                        teacher = None
+                    for off in range(2, 6):
+                        if (r + off) >= nrows:
+                            break
+                        try:
+                            t = df.iat[r + off, col]
+                        except Exception:
+                            t = None
+                        if t and not pd.isna(t) and not is_time_like(t):
+                            teachers.append(str(t).strip())
+                teachers = list(dict.fromkeys(teachers))
 
-                # find first time-like cell after summary to avoid grabbing next-session summary
+                # find first time-like cell after summary
                 stop_idx = None
                 for off in range(1, 12):
                     idx = r + off
@@ -163,7 +158,7 @@ def parse_sheet_to_events(xls, sheet_name):
                 if stop_idx is None:
                     stop_idx = min(r + 7, nrows)
 
-                # description cells between summary line and first time cell (exclusive)
+                # description cells
                 desc_parts = []
                 for idx in range(r + 1, stop_idx):
                     if idx >= nrows:
@@ -179,14 +174,12 @@ def parse_sheet_to_events(xls, sheet_name):
                         continue
                     if to_date(cell) is not None:
                         continue
-                    if teacher and s == teacher:
-                        continue
-                    if s == summary_str:
+                    if s in teachers or s == summary_str:
                         continue
                     desc_parts.append(s)
                 desc_text = " | ".join(dict.fromkeys(desc_parts))
 
-                # find start/end time (scan forward)
+                # start/end time
                 start_val = None
                 end_val = None
                 for off in range(1, 13):
@@ -219,7 +212,7 @@ def parse_sheet_to_events(xls, sheet_name):
                 dtstart = datetime.combine(d, start_t)
                 dtend = datetime.combine(d, end_t)
 
-                # groups detection
+                # groups
                 gl = None
                 gl_next = None
                 if group_row < nrows:
@@ -252,7 +245,7 @@ def parse_sheet_to_events(xls, sheet_name):
 
                 raw_events.append({
                     'summary': summary_str,
-                    'teachers': set([teacher]) if teacher else set(),
+                    'teachers': set(teachers),
                     'descriptions': set([desc_text]) if desc_text else set(),
                     'start': dtstart,
                     'end': dtend,
@@ -288,17 +281,9 @@ def parse_sheet_to_events(xls, sheet_name):
         })
     return out
 
-# ---------------- Maquette loader (flexible) ----------------
+# ---------------- Maquette loader ----------------
 
 def read_maquette(xls):
-    """
-    Look up sheet 'Maquette' (case-insensitive). Try to find columns:
-      - matter/subject name
-      - promo (P1/P2)
-      - target sessions (col names: 'seances','sessions','target','cible','nb', 'heures')
-    Returns DataFrame normalized with columns: ['promo','subject','target']
-    If Maquette not present or malformed returns empty DataFrame.
-    """
     sheet_candidates = [s for s in xls.sheet_names if s.lower() == 'maquette' or 'maquette' in s.lower()]
     if not sheet_candidates:
         return pd.DataFrame(columns=['promo','subject','target'])
@@ -309,7 +294,6 @@ def read_maquette(xls):
         return pd.DataFrame(columns=['promo','subject','target'])
 
     cols = {c.lower(): c for c in mq.columns}
-    # heuristics
     subject_col = None
     promo_col = None
     target_col = None
@@ -325,14 +309,12 @@ def read_maquette(xls):
     if subject_col is None:
         return pd.DataFrame(columns=['promo','subject','target'])
 
-    # build normalized dataframe
     rows = []
     for _, row in mq.iterrows():
         subject = row.get(subject_col)
         if pd.isna(subject): continue
         promo = row.get(promo_col) if promo_col else None
         target = row.get(target_col) if target_col else None
-        # try to coerce numeric target
         try:
             tval = float(target) if target is not None and not pd.isna(target) else None
         except Exception:
@@ -344,10 +326,6 @@ def read_maquette(xls):
 # ---------------- Aggregation helpers ----------------
 
 def build_events_index(xls, sheet_names):
-    """
-    Parse provided sheets and return a dict promo->events list
-    promo names are sheet names (e.g. 'EDT P1','EDT P2')
-    """
     out = {}
     for s in sheet_names:
         try:
@@ -357,16 +335,18 @@ def build_events_index(xls, sheet_names):
             out[s] = []
     return out
 
-def count_sessions_by_subject(events):
-    """Return dict subject->count of events (sessions)"""
-    cnt = {}
+def sum_hours_by_subject(events):
+    totals = {}
     for ev in events:
+        if ev['start'] and ev['end']:
+            delta = (ev['end'] - ev['start']).total_seconds() / 3600.0
+        else:
+            delta = 0
         subj = ev['summary']
-        cnt[subj] = cnt.get(subj, 0) + 1
-    return cnt
+        totals[subj] = totals.get(subj, 0) + delta
+    return totals
 
 def flatten_events_table(events):
-    """Return DataFrame rows with columns: subject,start,end,groups,teachers,description"""
     rows = []
     for ev in events:
         rows.append({
@@ -401,15 +381,10 @@ except Exception as e:
 
 st.write('Feuilles trouvées :', sheets)
 
-# parse events for P1/P2 if present
 promo_sheets = [s for s in sheets if s.strip().upper() in ['EDT P1','EDT P2','P1','P2','EDT P1 ','EDT P2 ']]
-# fallback: if exact names present use them
-candidates = []
-if 'EDT P1' in sheets: candidates.append('EDT P1')
-if 'EDT P2' in sheets: candidates.append('EDT P2')
-if not candidates:
-    # take any sheets starting with 'EDT' or containing 'P1'/'P2'
-    candidates = [s for s in sheets if 'EDT' in s.upper() or 'P1' in s.upper() or 'P2' in s.upper()]
+if not promo_sheets:
+    promo_sheets = [s for s in sheets if 'EDT' in s.upper() or 'P1' in s.upper() or 'P2' in s.upper()]
+
 promo_sheets = [s for s in ['EDT P1','EDT P2'] if s in sheets] or promo_sheets
 
 events_by_promo = build_events_index(xls, promo_sheets)
@@ -423,78 +398,62 @@ page = st.sidebar.selectbox('Page', [
     '4 — Récap complet textuel'
 ])
 
-# ---------- Page 1: comparaison ----------
+# ---------- Page 1 ----------
 if page.startswith('1'):
-    st.header('Comparaison des séances par matière vs Maquette')
-    st.write('Hypothèse : on compare le **nombre de séances** extraites au **target** dans la feuille Maquette (si présente).')
+    st.header('Comparaison des heures par matière vs Maquette')
     if maquette_df.empty:
-        st.warning('Feuille Maquette non trouvée ou non lisible — seul le total des séances extraites sera affiché.')
-    # compute counts
+        st.warning('Feuille Maquette non trouvée ou non lisible — seul le total des heures extraites sera affiché.')
     results = []
     for promo, evs in events_by_promo.items():
-        counts = count_sessions_by_subject(evs)
-        # build DataFrame for this promo
-        dfp = pd.DataFrame([(k, v) for k, v in counts.items()], columns=['subject','count'])
+        totals = sum_hours_by_subject(evs)
+        dfp = pd.DataFrame([(k, v) for k, v in totals.items()], columns=['subject','hours'])
         dfp['promo_sheet'] = promo
-        # if maquette present, find targets matching subject and promo
         if not maquette_df.empty:
-            # try to match ignoring case and whitespace
             def find_target(subject):
-                # try exact match
                 m = maquette_df[maquette_df['subject'].str.lower().str.strip() == subject.lower().strip()]
                 if not m.empty:
-                    # if promo column used, prefer matching row where promo matches
                     if 'promo' in maquette_df.columns and m.shape[0] > 1:
                         mm = m[m['promo'].str.contains(promo.split()[-1]) if m['promo'].notna().any() else False]
                         if not mm.empty:
                             return mm['target'].iloc[0]
                     return m['target'].iloc[0]
-                # fuzzy: contains
                 m2 = maquette_df[maquette_df['subject'].str.lower().str.contains(subject.split()[0].lower())]
                 if not m2.empty:
                     return m2['target'].iloc[0]
                 return None
             dfp['target'] = dfp['subject'].apply(find_target)
-            dfp['diff'] = dfp.apply(lambda r: (r['count'] - r['target']) if pd.notna(r['target']) else None, axis=1)
+            dfp['diff'] = dfp.apply(lambda r: (r['hours'] - r['target']) if pd.notna(r['target']) else None, axis=1)
         results.append(dfp)
     if results:
         full = pd.concat(results, ignore_index=True)
         st.dataframe(full.sort_values(['promo_sheet','subject']).reset_index(drop=True))
     else:
-        st.info('Aucune séance détectée dans les feuilles sélectionnées.')
+        st.info('Aucune séance détectée.')
 
-# ---------- Page 2: recap by subject ----------
+# ---------- Page 2 ----------
 elif page.startswith('2'):
     st.header('Récapitulatif par matière (sélectionne une matière)')
-    # compile set of subjects
     subjects = set()
     for evs in events_by_promo.values():
         for ev in evs:
             subjects.add(ev['summary'])
     subjects = sorted(list(subjects))
     if not subjects:
-        st.warning('Aucune matière trouvée dans les plannings.')
+        st.warning('Aucune matière trouvée.')
     else:
         chosen = st.selectbox('Choisir une matière', options=subjects)
         st.write(f'Séances pour : **{chosen}**')
-        cols = ['subject','start','end','groups','teachers','description']
-        tables = {}
         for promo, evs in events_by_promo.items():
             df_ev = flatten_events_table([e for e in evs if e['summary'] == chosen])
+            st.subheader(promo)
             if df_ev.empty:
-                st.subheader(promo)
                 st.info('Aucune séance pour cette matière.')
-            else:
-                st.subheader(promo)
-                # sort by date
-                df_ev = df_ev.sort_values('start')
-                # afficher deux tables? l'utilisateur demandait deux tableaux (un pour P1 et un pour P2) — on affiche par promo
-                st.dataframe(df_ev.reset_index(drop=True))
+                else:
+                st.dataframe(df_ev.sort_values('start').reset_index(drop=True))
 
-# ---------- Page 3: recap by teacher ----------
+# ---------- Page 3 ----------
 elif page.startswith('3'):
     st.header('Récapitulatif par enseignant')
-    # build list of teachers
     teachers = set()
     for evs in events_by_promo.values():
         for ev in evs:
@@ -515,7 +474,7 @@ elif page.startswith('3'):
             else:
                 st.dataframe(df_ev.sort_values('start').reset_index(drop=True))
 
-# ---------- Page 4: textual recap ----------
+# ---------- Page 4 ----------
 else:
     st.header('Récapitulatif textuel complet (par promo)')
     for promo, evs in events_by_promo.items():
@@ -523,19 +482,17 @@ else:
         if not evs:
             st.info('Aucune séance détectée.')
             continue
-        # group by subject and list events
         by_subject = {}
         for e in evs:
             by_subject.setdefault(e['summary'], []).append(e)
         for subj in sorted(by_subject.keys()):
             st.markdown(f'**{subj}**')
-            lst = by_subject[subj]
-            # sort by date
-            lst = sorted(lst, key=lambda x: x['start'])
+            lst = sorted(by_subject[subj], key=lambda x: x['start'])
             for e in lst:
                 groups = ', '.join(e['groups']) if e['groups'] else '—'
                 teachers = ', '.join(e['teachers']) if e['teachers'] else '—'
                 desc = e['description'] if e.get('description') else ''
-                st.write(f"- {e['start'].strftime('%Y-%m-%d %H:%M')} → {e['end'].strftime('%H:%M')} — Groupes: {groups} — Enseignant(s): {teachers} {('- '+desc) if desc else ''}")
-
-# end
+                st.write(
+                    f"- {e['start'].strftime('%Y-%m-%d %H:%M')} → {e['end'].strftime('%H:%M')} "
+                    f"— Groupes: {groups} — Enseignant(s): {teachers} {('- '+desc) if desc else ''}"
+                )
