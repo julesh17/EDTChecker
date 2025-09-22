@@ -96,28 +96,9 @@ def find_slot_rows(df):
             rows.append(i)
     return rows
 
-from openpyxl import load_workbook
-
 def parse_sheet_to_events(xls, sheet_name):
-    # Charger dataframe pour parsing normal
     df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
     nrows, ncols = df.shape
-
-    # Charger la même feuille avec openpyxl pour détecter les fusions
-    wb = load_workbook(xls, data_only=True)
-    ws = wb[sheet_name]
-    merged_ranges = ws.merged_cells.ranges
-
-    def is_merged_with_next(r, c):
-        """Retourne True si la cellule (r,c) est fusionnée avec (r,c+1)"""
-        cell_coord = ws.cell(r+1, c+1).coordinate  # openpyxl est 1-based
-        for merged in merged_ranges:
-            if cell_coord in merged:
-                # Vérifie si fusion horizontale qui inclut la colonne suivante
-                min_col, min_row, max_col, max_row = merged.bounds
-                if min_row == max_row and c+2 <= max_col:
-                    return True
-        return False
 
     s_rows = find_week_rows(df)
     h_rows = find_slot_rows(df)
@@ -148,7 +129,7 @@ def parse_sheet_to_events(xls, sheet_name):
                 if not summary_str:
                     continue
 
-                # collect teachers
+                # collect teachers (multiple)
                 teachers = []
                 if (r + 2) < nrows:
                     for off in range(2, 6):
@@ -177,7 +158,7 @@ def parse_sheet_to_events(xls, sheet_name):
                 if stop_idx is None:
                     stop_idx = min(r + 7, nrows)
 
-                # description
+                # description cells
                 desc_parts = []
                 for idx in range(r + 1, stop_idx):
                     if idx >= nrows:
@@ -198,7 +179,7 @@ def parse_sheet_to_events(xls, sheet_name):
                     desc_parts.append(s)
                 desc_text = " | ".join(dict.fromkeys(desc_parts))
 
-                # start/end times
+                # start/end time
                 start_val = None
                 end_val = None
                 for off in range(1, 13):
@@ -247,13 +228,17 @@ def parse_sheet_to_events(xls, sheet_name):
                         except Exception:
                             gl_next = None
 
+                is_left_col = (col == c)
+                right_summary = None
+                if (col + 1) < ncols:
+                    try:
+                        right_summary = df.iat[r, col + 1]
+                    except Exception:
+                        right_summary = None
+
                 groups = set()
-                if is_merged_with_next(r, col):
-                    # Cours G1 + G2
-                    if gl:
-                        groups.add(gl)
-                    if gl_next:
-                        groups.add(gl_next)
+                if is_left_col and (pd.isna(right_summary) or right_summary is None) and gl and gl_next and gl != gl_next:
+                    groups.add(gl); groups.add(gl_next)
                 else:
                     if gl:
                         groups.add(gl)
@@ -267,7 +252,7 @@ def parse_sheet_to_events(xls, sheet_name):
                     'groups': groups
                 })
 
-    # merge raw events
+    # merge raw events by (summary, start, end)
     merged = {}
     for e in raw_events:
         key = (e['summary'], e['start'], e['end'])
@@ -295,7 +280,6 @@ def parse_sheet_to_events(xls, sheet_name):
             'groups': sorted(list(v['groups']))
         })
     return out
-
 
 # ---------------- Maquette loader ----------------
 
