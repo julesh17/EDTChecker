@@ -1,8 +1,10 @@
 import streamlit as st
 import pandas as pd
 import re
+import io
 from datetime import datetime, date, time
 from dateutil import parser as dtparser
+from openpyxl import load_workbook
 
 # ---------------- Utilities ----------------
 
@@ -96,9 +98,56 @@ def find_slot_rows(df):
             rows.append(i)
     return rows
 
-def parse_sheet_to_events(xls, sheet_name):
-    df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+# ---------------- Helpers Fusion ----------------
+
+def get_merged_map_from_bytes(xls_bytes, sheet_name):
+    """
+    Retourne un dict {(row_zero_based, col_zero_based): (r1,c1,r2,c2)} pour les ranges fusionnées
+    basé sur le sheet_name. On lit depuis bytes (io.BytesIO).
+    """
+    wb = load_workbook(io.BytesIO(xls_bytes), data_only=True)
+    ws = wb[sheet_name]
+    merged_map = {}
+    for merged in ws.merged_cells.ranges:
+        r1, r2 = merged.min_row, merged.max_row
+        c1, c2 = merged.min_col, merged.max_col
+        # convert to zero-based indices
+        for r in range(r1, r2 + 1):
+            for c in range(c1, c2 + 1):
+                merged_map[(r - 1, c - 1)] = (r1 - 1, c1 - 1, r2 - 1, c2 - 1)
+    return merged_map
+
+# ---------------- Parsing ----------------
+
+def parse_sheet_to_events(uploaded_file, sheet_name):
+    """
+    uploaded_file : object retourné par st.file_uploader (file-like)
+    sheet_name : nom de la feuille
+    """
+    # read bytes once and reuse for both pandas and openpyxl
+    if hasattr(uploaded_file, 'read'):
+        xls_bytes = uploaded_file.read()
+        # reset pointer for uploaded_file if needed by streamlit later (UploadedFile cannot be rewound easily),
+        # but we've already consumed it; downstream code uses xls (pd.ExcelFile) created below from bytes.
+    else:
+        # uploaded_file might be a path string
+        with open(uploaded_file, 'rb') as f:
+            xls_bytes = f.read()
+
+    # read sheet into dataframe
+    try:
+        df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet_name, header=None, engine='openpyxl')
+    except Exception as e:
+        # in case of error, return empty
+        return []
+
     nrows, ncols = df.shape
+
+    # build merged map for this sheet
+    try:
+        merged_map = get_merged_map_from_bytes(xls_bytes, sheet_name)
+    except Exception:
+        merged_map = {}
 
     s_rows = find_week_rows(df)
     h_rows = find_slot_rows(df)
@@ -140,7 +189,9 @@ def parse_sheet_to_events(xls, sheet_name):
                         except Exception:
                             t = None
                         if t and not pd.isna(t) and not is_time_like(t):
-                            teachers.append(str(t).strip())
+                            s_t = str(t).strip()
+                            if s_t:
+                                teachers.append(s_t)
                 teachers = list(dict.fromkeys(teachers))
 
                 # find first time-like cell after summary
@@ -221,12 +272,12 @@ def parse_sheet_to_events(xls, sheet_name):
                         gl = normalize_group_label(gl_raw)
                     except Exception:
                         gl = None
-                    if (col + 1) < ncols:
-                        try:
-                            gl_next_raw = df.iat[group_row, col + 1]
-                            gl_next = normalize_group_label(gl_next_raw)
-                        except Exception:
-                            gl_next = None
+                if (col + 1) < ncols and group_row < nrows:
+                    try:
+                        gl_next_raw = df.iat[group_row, col + 1]
+                        gl_next = normalize_group_label(gl_next_raw)
+                    except Exception:
+                        gl_next = None
 
                 is_left_col = (col == c)
                 right_summary = None
@@ -237,9 +288,24 @@ def parse_sheet_to_events(xls, sheet_name):
                         right_summary = None
 
                 groups = set()
-                if is_left_col and (pd.isna(right_summary) or right_summary is None) and gl and gl_next and gl != gl_next:
-                    groups.add(gl); groups.add(gl_next)
+                # ---- Use merged_map to detect real Excel merge between (r,col) and (r,col+1) ----
+                if is_left_col:
+                    merged_here = merged_map.get((r, col))
+                    merged_right = merged_map.get((r, col + 1))
+                    # if both cells belong to a same merged range that spans the adjacent column,
+                    # treat it as a shared course (G1+G2)
+                    if merged_here is not None and merged_right is not None and merged_here == merged_right:
+                        # add both group labels if present
+                        if gl:
+                            groups.add(gl)
+                        if gl_next:
+                            groups.add(gl_next)
+                    else:
+                        # not merged across columns: normal behavior (only left group)
+                        if gl:
+                            groups.add(gl)
                 else:
+                    # right column event (only add its group)
                     if gl:
                         groups.add(gl)
 
@@ -373,7 +439,9 @@ if uploaded is None:
     st.stop()
 
 try:
-    xls = pd.ExcelFile(uploaded)
+    # create a pandas ExcelFile from uploaded bytes so read_maquette / listing work
+    xls_bytes_for_listing = uploaded.read()
+    xls = pd.ExcelFile(io.BytesIO(xls_bytes_for_listing), engine='openpyxl')
     sheets = xls.sheet_names
 except Exception as e:
     st.error('Impossible de lire le fichier Excel: ' + str(e))
@@ -387,7 +455,17 @@ if not promo_sheets:
 
 promo_sheets = [s for s in ['EDT P1','EDT P2'] if s in sheets] or promo_sheets
 
-events_by_promo = build_events_index(xls, promo_sheets)
+# build events using the original uploaded file object — parse_sheet_to_events expects the uploaded file-like,
+# but it already consumed uploaded.read() above, so we pass the bytes we saved to parse_sheet_to_events:
+class _BytesWrapper:
+    def __init__(self, b):
+        self._b = b
+    def read(self):
+        return self._b
+
+uploaded_bytes_wrapper = _BytesWrapper(xls_bytes_for_listing)
+
+events_by_promo = build_events_index(uploaded_bytes_wrapper, promo_sheets)
 maquette_df = read_maquette(xls)
 
 # navigation
