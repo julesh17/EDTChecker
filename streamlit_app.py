@@ -350,74 +350,116 @@ def parse_sheet_to_events(uploaded_file, sheet_name):
 # ---------------- Maquette loader ----------------
 
 def read_maquette(xls):
-    # xls : pandas.ExcelFile ou path-like acceptable par pd.read_excel
+    """
+    Lit la feuille Maquette et retourne un DataFrame avec colonnes :
+    ['semester', 'ue', 'promo', 'subject', 'target']
+    - conserve l'ordre d'apparition dans la feuille (pour l'affichage)
+    """
     sheet_candidates = [s for s in xls.sheet_names if s.lower() == 'maquette' or 'maquette' in s.lower()]
     if not sheet_candidates:
-        return pd.DataFrame(columns=['promo','group','subject','target'])
+        return pd.DataFrame(columns=['semester','ue','promo','subject','target'])
     sheet = sheet_candidates[0]
     try:
         mq = pd.read_excel(xls, sheet_name=sheet)
     except Exception:
-        return pd.DataFrame(columns=['promo','group','subject','target'])
+        return pd.DataFrame(columns=['semester','ue','promo','subject','target'])
 
-    # map lowercase column name -> original
-    cols = {c.lower(): c for c in mq.columns}
+    # normalise noms de colonnes en minuscules pour détecter 'semester' et 'ue'
+    cols = {c.lower().strip(): c for c in mq.columns}
+    # detect subject column
     subject_col = None
     promo_col = None
     target_col = None
-    group_col = None
+    sem_col = None
+    ue_col = None
 
-    # detect subject column by keywords
     for k in cols:
         if any(w in k for w in ['mati', 'subject', 'module', 'ue', 'course']):
-            subject_col = cols[k]
-            break
-
-    # detect promo column
+            subject_col = cols[k]; break
     for k in cols:
         if any(w in k for w in ['promo','promotion','year','p1','p2']):
-            promo_col = cols[k]
-            break
-
-    # detect group column (if any)
+            promo_col = cols[k]; break
     for k in cols:
-        if any(w in k for w in ['groupe','group','grp','g']):
-            # be careful: don't mis-detect single-letter columns; require longer match
-            group_col = cols[k]
-            break
-
-    # detect total/target column (look for 'total' specifically plus other variants)
+        if any(w in k for w in ['seanc','session','target','cibl','nb','heure','hours']):
+            target_col = cols[k]; break
     for k in cols:
-        if any(w in k for w in ['total','target','seanc','session','cibl','nb','heure','hours','htotal']):
-            target_col = cols[k]
-            break
+        if any(w in k for w in ['sem', 'semestre', 'semester']):
+            sem_col = cols[k]; break
+    for k in cols:
+        if k == 'ue' or 'ue' in k:
+            ue_col = cols[k]; break
+
+    # fallback: use first / second column as semester/ue if names not found
+    col_list = list(mq.columns)
+    if sem_col is None and len(col_list) >= 1:
+        # try to guess: if the first col doesn't look like subject, use it for semester
+        # but keep safe: only set if different from subject column
+        if subject_col is None or col_list[0] != subject_col:
+            sem_col = col_list[0]
+    if ue_col is None and len(col_list) >= 2:
+        if subject_col is None or col_list[1] != subject_col:
+            ue_col = col_list[1]
+
+    # if subject not found, try first column that is not semester/ue
+    if subject_col is None:
+        for c in col_list:
+            if c != sem_col and c != ue_col:
+                subject_col = c
+                break
 
     if subject_col is None:
-        # can't do much without subject column
-        return pd.DataFrame(columns=['promo','group','subject','target'])
+        return pd.DataFrame(columns=['semester','ue','promo','subject','target'])
 
     rows = []
     for _, row in mq.iterrows():
         subject = row.get(subject_col)
-        if pd.isna(subject):
-            continue
-        promo = row.get(promo_col) if promo_col else ''
-        group = row.get(group_col) if group_col else ''
+        if pd.isna(subject): continue
+        promo = row.get(promo_col) if promo_col else None
         target = row.get(target_col) if target_col else None
+        sem = row.get(sem_col) if sem_col else None
+        ue = row.get(ue_col) if ue_col else None
         try:
             tval = float(target) if target is not None and not pd.isna(target) else None
         except Exception:
             tval = None
-
         promo_str = str(promo).strip() if promo and not pd.isna(promo) else ''
-        group_str = str(group).strip() if group and not pd.isna(group) else ''
         rows.append({
+            'semester': str(sem).strip() if sem and not pd.isna(sem) else '',
+            'ue': str(ue).strip() if ue and not pd.isna(ue) else '',
             'promo': promo_str,
-            'group': group_str,
             'subject': str(subject).strip(),
             'target': tval
         })
-    return pd.DataFrame(rows, columns=['promo','group','subject','target'])
+    # preserve original order (already in rows order)
+    return pd.DataFrame(rows, columns=['semester','ue','promo','subject','target'])
+
+
+def sum_hours_by_subject_and_group(events):
+    """
+    Retourne dict:
+      totals[subject][group] = hours
+    group labels are like 'G 1' or 'G 2' or 'G1' or 'G 2' depending de normalize_group_label
+    Nous allons normaliser en 'G1','G2' (sans espace) pour facilité.
+    """
+    totals = {}
+    for ev in events:
+        if ev['start'] and ev['end']:
+            delta = (ev['end'] - ev['start']).total_seconds() / 3600.0
+        else:
+            delta = 0.0
+        subj = ev['summary']
+        groups = ev.get('groups') or []
+        # si pas de groupe indiqué, on peut associer à 'ALL' (ou ignorer) — ici on met 'ALL'
+        if not groups:
+            groups = ['ALL']
+        for g in groups:
+            # normalise 'G 1' -> 'G1'
+            g_norm = re.sub(r'\s+', '', g).upper()
+            g_norm = g_norm.replace('G.', 'G').replace('GROUP', 'G')
+            if subj not in totals:
+                totals[subj] = {}
+            totals[subj][g_norm] = totals[subj].get(g_norm, 0.0) + delta
+    return totals
 
 # ---------------- Aggregation helpers ----------------
 
@@ -508,139 +550,118 @@ page = st.sidebar.selectbox('Page', [
 
 # ---------- Page 1 ----------
 if page.startswith('1'):
-    st.header('Comparaison des heures par matière vs Maquette (par promo & groupe)')
+    st.header('Comparaison des heures par matière vs Maquette')
+
     if maquette_df.empty:
         st.warning('Feuille Maquette non trouvée ou non lisible — seul le total des heures extraites sera affiché.')
 
-    # helper pour extraire "P1"/"P2" depuis le nom de la feuille
-    def promo_from_sheetname(sheetname):
-        s = sheetname.upper()
-        if 'P1' in s:
-            return 'P1'
-        if 'P2' in s:
-            return 'P2'
-        # fallback: take last token if looks like P1/P2
-        tokens = re.findall(r'P\s*1|P\s*2|P1|P2', s)
-        if tokens:
-            return tokens[0].replace(' ', '')
-        return sheetname
+    # choix promo et groupe dans la sidebar
+    promo_choice = st.sidebar.selectbox('Promo à comparer', options=['P1', 'P2'])
+    group_choice = st.sidebar.selectbox('Groupe à comparer', options=['G1', 'G2'])
 
-    # normaliser groupe: transforme "G 1" -> "G1", "G 2" -> "G2"
-    def norm_group_label_for_key(g):
-        if g is None:
-            return None
-        try:
-            s = str(g).strip()
-        except Exception:
-            return None
-        if not s:
-            return None
-        # use normalize_group_label then remove spaces
-        gg = normalize_group_label(s)
-        if gg:
-            return gg.replace(' ', '')  # "G 1" -> "G1"
-        return s.replace(' ', '')
-
-    # build aggregation: (promo, group, subject) -> hours
-    agg = {}  # key: (promo, group, subject) -> hours (float)
-
-    for sheet_name, evs in events_by_promo.items():
-        promo = promo_from_sheetname(sheet_name)
-        for ev in evs:
-            # duration in hours
-            if ev.get('start') and ev.get('end'):
-                dur = (ev['end'] - ev['start']).total_seconds() / 3600.0
-            else:
-                dur = 0.0
-            subj = ev.get('summary', '').strip()
-            groups = ev.get('groups', []) or []
-            # if event groups is empty, try to attribute to both G1 & G2? We'll skip unknown group
-            if not groups:
-                # optional: count into a special group 'UNK' (commented out)
-                # key = (promo, 'UNK', subj)
-                # agg[key] = agg.get(key, 0.0) + dur
-                continue
-            # groups may be strings like 'G 1' etc. normalize each
-            for g in groups:
-                ng = norm_group_label_for_key(g)
-                if not ng:
-                    continue
-                key = (promo, ng, subj)
-                agg[key] = agg.get(key, 0.0) + dur
-
-    # create dataframe from agg
-    rows = []
-    for (promo, group, subj), hours in agg.items():
-        rows.append({'promo': promo, 'group': group, 'subject': subj, 'hours': hours})
-    if not rows:
-        st.info('Aucune séance détectée (ou aucune info de groupe présente).')
+    # trouver la feuille correspondant à la promo choisie
+    # priorité à 'EDT P1' / 'EDT P2' exact, sinon cherche une feuille contenant 'P1' ou 'P2'
+    target_sheet = None
+    candidates = [s for s in promo_sheets if promo_choice in s.upper()]
+    # prefer exact match 'EDT P1' etc
+    if f'EDT {promo_choice}' in sheets:
+        target_sheet = f'EDT {promo_choice}'
+    elif candidates:
+        target_sheet = candidates[0]
     else:
-        df_hours = pd.DataFrame(rows)
-        # try to attach target from maquette_df
-        def find_target_for(promo, group, subject):
-            if maquette_df.empty:
-                return None
-            ssub = str(subject).strip().lower()
-            # exact match on subject
-            m = maquette_df[maquette_df['subject'].str.lower().str.strip() == ssub]
-            if not m.empty:
-                # prefer rows that match both promo and group if available
-                if 'promo' in maquette_df.columns and 'group' in maquette_df.columns:
-                    mm = m[m['promo'].str.lower().str.contains(promo.lower()) & m['group'].str.lower().str.contains(group.lower())]
-                    if not mm.empty:
-                        return mm['target'].iloc[0]
-                # prefer rows that match promo
-                if 'promo' in maquette_df.columns and m.shape[0] > 1:
-                    mm = m[m['promo'].str.lower().str.contains(promo.lower())]
-                    if not mm.empty:
-                        return mm['target'].iloc[0]
-                # otherwise return first matching subject row's target
-                return m['target'].iloc[0]
+        # fallback: take any sheet that mentions P1/P2
+        any_match = [s for s in sheets if promo_choice in s.upper()]
+        if any_match:
+            target_sheet = any_match[0]
 
-            # try partial subject matching (first token)
-            first_tok = subject.split()[0].lower()
-            m2 = maquette_df[maquette_df['subject'].str.lower().str.contains(re.escape(first_tok))]
-            if not m2.empty:
-                # if group present in maquette, prefer matching row
-                if 'group' in maquette_df.columns and any(m2['group'].notna()):
-                    mm = m2[m2['group'].str.lower().str.contains(group.lower(), na=False)]
-                    if not mm.empty:
-                        return mm['target'].iloc[0]
-                # prefer matching promo
-                if 'promo' in maquette_df.columns and any(m2['promo'].notna()):
-                    mm = m2[m2['promo'].str.lower().str.contains(promo.lower(), na=False)]
-                    if not mm.empty:
-                        return mm['target'].iloc[0]
-                return m2['target'].iloc[0]
-            return None
+    if not target_sheet:
+        st.error(f"Aucune feuille d'emploi du temps trouvée pour {promo_choice}. Feuilles détectées: {sheets}")
+        st.stop()
 
-        df_hours['target'] = df_hours.apply(lambda r: find_target_for(r['promo'], r['group'], r['subject']), axis=1)
-        # If maquette target is None but maquette has rows without group (i.e. target per subject per promo),
-        # try to fill by matching subject+promo ignoring group
-        if not maquette_df.empty:
-            # If a subject has no target but there's a maquette subject matching and no group specified in maquette,
-            # assume target applies to both groups (so it's fine to keep that value)
-            pass
+    st.write(f"Feuille utilisée pour la comparaison: **{target_sheet}** — Groupe: **{group_choice}**")
 
-        # compute diff
-        def diff_val(row):
-            if pd.isna(row['target']) or row['target'] is None:
-                return None
-            return row['hours'] - float(row['target'])
-        df_hours['diff'] = df_hours.apply(diff_val, axis=1)
+    events = events_by_promo.get(target_sheet, [])
+    totals_by_subject = sum_hours_by_subject_and_group(events)
 
-        # Present the results: table + pivot
-        st.subheader('Détail par promo / groupe / matière')
-        st.dataframe(df_hours.sort_values(['promo','group','subject']).reset_index(drop=True))
+    # Construire le DataFrame final en respectant l'ordre de la maquette
+    rows = []
+    # filtre maquette pour la promo choisie (maquette peut contenir des lignes sans promo)
+    if not maquette_df.empty:
+        # we consider a row matches the promo if promo column contains P1/P2 OR empty
+        def promo_matches(promo_cell):
+            if not promo_cell or str(promo_cell).strip() == '':
+                return True
+            return promo_choice in str(promo_cell).upper()
 
-        st.subheader('Vue pivot : heures vs maquette (par promo et groupe)')
-        try:
-            pivot = df_hours.pivot_table(index=['subject'], columns=['promo','group'], values=['hours','target','diff'], aggfunc='sum')
-            # flatten columns nicely
-            pivot.columns = ['_'.join([str(i) for i in col if i is not None]) for col in pivot.columns.values]
-            st.dataframe(pivot.fillna('—'))
-        except Exception:
-            st.info('Impossible de générer la vue pivot — affichage détaillé fourni ci-dessus.')
+        mq_rows = maquette_df[maquette_df['promo'].apply(lambda x: promo_matches(x))]
+        # preserve order (already)
+        for _, r in mq_rows.iterrows():
+            subj = r['subject']
+            sem = r.get('semester', '')
+            ue = r.get('ue', '')
+            target = r.get('target', None)
+            # lookup actual hours: subject match try exact lower strip, then contains fallback
+            actual = 0.0
+            found_key = None
+            # attempt direct key match in totals_by_subject
+            for s_key in totals_by_subject.keys():
+                if s_key.strip().lower() == subj.strip().lower():
+                    found_key = s_key; break
+            if not found_key:
+                # fallback: contains
+                for s_key in totals_by_subject.keys():
+                    if subj.strip().lower() in s_key.strip().lower() or s_key.strip().lower() in subj.strip().lower():
+                        found_key = s_key; break
+            if found_key:
+                # totals_by_subject[found_key] is dict per group
+                gdict = totals_by_subject[found_key]
+                # group_choice normalization e.g. 'G1' compare to keys like 'G1' or 'G 1'
+                key_norm = group_choice.upper().replace(' ', '')
+                actual = gdict.get(key_norm, 0.0) + gdict.get('ALL', 0.0)
+            else:
+                actual = 0.0
+
+            diff = None
+            if target is not None:
+                diff = actual - float(target)
+            status = 'OK' if (target is not None and actual >= float(target) - 1e-6) else ('MANQUANT' if target is not None else '')
+            rows.append({
+                'semester': sem,
+                'ue': ue,
+                'subject': subj,
+                'target': target,
+                'actual_hours': round(actual, 2),
+                'diff': round(diff, 2) if diff is not None else None,
+                'status': status
+            })
+
+        df_compare = pd.DataFrame(rows, columns=['semester','ue','subject','target','actual_hours','diff','status'])
+        st.write('Comparatif (toutes les matières de la Maquette dans l\'ordre)')
+        st.dataframe(df_compare)
+
+        # montrer les matières trouvées dans les EDT mais non présentes dans la maquette
+        present_subjects = set([k for k in totals_by_subject.keys()])
+        maquette_subjects = set([s.strip().lower() for s in maquette_df['subject'].tolist() if s and str(s).strip()])
+        extras = []
+        for s in present_subjects:
+            if s.strip().lower() not in maquette_subjects:
+                # report hours for the chosen group
+                gdict = totals_by_subject[s]
+                actual = gdict.get(group_choice.replace(' ', ''), 0.0) + gdict.get('ALL', 0.0)
+                extras.append({'subject': s, 'actual_hours': round(actual,2)})
+        if extras:
+            st.warning('Matières détectées dans l\'EDT mais absentes de la Maquette : vérifie le nom exact dans la Maquette.')
+            st.table(pd.DataFrame(extras))
+    else:
+        # pas de maquette : afficher juste le total des heures par matière pour le groupe choisi
+        rows = []
+        for subj, gdict in totals_by_subject.items():
+            actual = gdict.get(group_choice.replace(' ', ''), 0.0) + gdict.get('ALL', 0.0)
+            rows.append({'subject': subj, 'actual_hours': round(actual,2)})
+        if rows:
+            st.dataframe(pd.DataFrame(rows).sort_values('subject').reset_index(drop=True))
+        else:
+            st.info('Aucune séance détectée pour cette feuille/promo.')
             
 # ---------- Page 2 ----------
 elif page.startswith('2'):
