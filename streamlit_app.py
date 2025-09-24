@@ -536,7 +536,6 @@ if page.startswith('1'):
 
     if maquette_df.empty:
         st.warning('Feuille Maquette non trouvée ou non lisible — impossible de faire un comparatif complet.')
-        # on peut néanmoins afficher un récap simple par feuille
         for promo, evs in events_by_promo.items():
             st.subheader(promo)
             totals = sum_hours_by_subject(evs)
@@ -549,67 +548,71 @@ if page.startswith('1'):
 
     # choix promo / groupe
     promo_choice = st.selectbox('Sélectionner la promo (feuille)', options=promo_sheets)
-    group_choice = st.selectbox('Sélectionner le groupe', options=['G 1', 'G 2', 'G1', 'G2', 'G 1+G 2', 'Tous'], index=0)
+    group_choice = st.selectbox('Sélectionner le groupe', options=['G 1', 'G 2'], index=0)
 
-    # normalize group selection to set for matching events
+    # normalisation du choix de groupe
     def parse_group_sel(sel):
         s = sel.strip().upper().replace(' ', '')
         if s in ['G1','G 1']:
-            return {'G 1','G1'}  # treat both forms; events.groups tends to be 'G 1'
+            return {'G 1','G1'}
         if s in ['G2','G 2']:
             return {'G 2','G2'}
-        if 'PLUS' in s or '+' in s or sel.lower().startswith('g 1+'):
-            return {'G 1','G2','G2'}  # intentionally wide
-        if sel.lower().startswith('t'):
-            return None  # None => match all groups
         return {sel}
 
     sel_groups = parse_group_sel(group_choice)
 
-    # get events for selected promo sheet
+    # événements pour la promo choisie
     evs = events_by_promo.get(promo_choice, [])
 
-    # compute hours and counts per subject but filtered by selected group
+    # matières à ignorer
+    IGNORE_SUBJECTS = {
+        "erasmus day",
+        "forum international",
+        "période entreprise",
+        "férié",
+        "mission à l'international",
+        "divers"
+    }
+
+    # calcul heures + séances par matière (filtrées par groupe et liste noire)
     def sum_hours_by_subject_and_group(events, groups_filter):
         totals = {}
         counts = {}
         for ev in events:
-            # determine if event applies to selected group
+            subj = ev['summary']
+            if subj and subj.strip().lower() in IGNORE_SUBJECTS:
+                continue  # skip
+
+            # filtrage par groupe
+            ev_groups_norm = set([g.strip().upper().replace(' ', '') for g in ev.get('groups', [])])
             if groups_filter is None:
                 matches = True
             else:
-                # event groups is a list like ['G 1'] or ['G 1','G 2']
-                if not ev.get('groups'):
-                    # if no group information, assume applies to all? -> treat as non-matching to avoid false positives
-                    matches = False
-                else:
-                    ev_groups_norm = set([g.strip().upper().replace(' ', '') for g in ev.get('groups')])
-                    # check intersection
-                    matches = len(ev_groups_norm.intersection(set([g.strip().upper().replace(' ', '') for g in groups_filter]))) > 0
-
+                matches = len(ev_groups_norm.intersection(
+                    {g.strip().upper().replace(' ', '') for g in groups_filter}
+                )) > 0
             if not matches:
                 continue
 
+            # durée
             if ev['start'] and ev['end']:
                 delta = (ev['end'] - ev['start']).total_seconds() / 3600.0
             else:
                 delta = 0
-            subj = ev['summary']
             totals[subj] = totals.get(subj, 0) + delta
             counts[subj] = counts.get(subj, 0) + 1
         return totals, counts
 
     totals_by_subject, counts_by_subject = sum_hours_by_subject_and_group(evs, sel_groups)
 
-    # build output DF listing ALL subjects in maquette in the same order (maquette_df preserves order)
+    # tableau final basé sur la maquette (dans l’ordre de la maquette)
     rows = []
     for _, row in maquette_df.iterrows():
         subj = str(row['subject']).strip()
+        if subj.lower() in IGNORE_SUBJECTS:
+            continue  # skip
+
         target = row['target'] if 'target' in row else None
-        # If maquette contains promo column and it's specific, we may filter subjects for promo but user asked
-        # to show all matières de la maquette (dans l'ordre) — keep all but optionally filter by promo substring
-        # If promo column not empty, we show only rows matching promo (e.g. 'P1'/'P2') OR show all depending on user's needs.
-        # Here, if maquette has a promo and it does not match the selected sheet (promo_choice), we still show with target=None.
         hours = totals_by_subject.get(subj, 0.0)
         sessions = counts_by_subject.get(subj, 0)
         diff = None
@@ -626,9 +629,8 @@ if page.startswith('1'):
     out_df = pd.DataFrame(rows, columns=['subject','target_hours','entered_hours','diff_hours','sessions_entered'])
 
     st.markdown(f"### Résultats pour la feuille **{promo_choice}** — groupe **{group_choice}**")
-    st.write("Toutes les matières de la maquette sont affichées (ordre maquette). Colonne `target_hours` = heures attendues (colonne M Maquette).")
+    st.write("Toutes les matières de la maquette sont affichées (ordre maquette). Les matières ignorées ne figurent pas dans ce tableau.")
 
-    # add some visual cues: highlight lines where diff != 0 or target missing
     def highlight_row(r):
         if r['target_hours'] is None or pd.isna(r['target_hours']):
             return ['background-color: #fff3cd']*len(r)
@@ -636,27 +638,26 @@ if page.startswith('1'):
             return ['background-color: #f8d7da']*len(r)
         return ['']*len(r)
 
-    # display styled dataframe
     try:
         st.dataframe(out_df.style.apply(highlight_row, axis=1))
     except Exception:
         st.dataframe(out_df)
 
-    # résumé / checks
+    # résumé
     total_expected = out_df['target_hours'].dropna().sum() if 'target_hours' in out_df.columns else None
     total_entered = out_df['entered_hours'].sum()
     st.markdown("**Résumé**")
     if total_expected is not None:
-        st.write(f"- Heures attendues (somme colonne Maquette): **{total_expected:.2f} h**")
+        st.write(f"- Heures attendues (maquette): **{total_expected:.2f} h**")
     else:
-        st.write("- Heures attendues : **non disponibles** dans la maquette.")
-    st.write(f"- Heures effectivement saisies pour la sélection : **{total_entered:.2f} h**")
+        st.write("- Heures attendues : **non disponibles**")
+    st.write(f"- Heures saisies: **{total_entered:.2f} h**")
     if total_expected is not None:
-        st.write(f"- Écart total (saisie - attendu) : **{(total_entered - total_expected):+.2f} h**")
+        st.write(f"- Écart total: **{(total_entered - total_expected):+.2f} h**")
 
     st.markdown("**Vérifications rapides**")
-    st.write("- Les lignes en jaune signifient que la maquette ne donne pas d'heures attendues pour cette matière.")
-    st.write("- Les lignes en rouge signifient un écart horaire (diff ≠ 0).")
+    st.write("- Jaune = pas d'heures attendues dans la maquette.")
+    st.write("- Rouge = écart entre heures saisies et maquette.")
 
 # ---------- Page 2 ----------
 elif page.startswith('2'):
