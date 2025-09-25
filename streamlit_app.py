@@ -571,6 +571,8 @@ if page.startswith('1'):
         "période entreprise",
         "férié",
         "mission à l'international",
+        "matière",
+        "matières",
         "divers"
     }
 
