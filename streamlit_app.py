@@ -527,7 +527,8 @@ page = st.sidebar.selectbox('Page', [
     '1 — Comparaison avec Maquette',
     '2 — Récap par matière',
     '3 — Récap par enseignant',
-    '4 — Récap complet textuel'
+    '4 — Récap complet textuel',
+    '5 — Récap heures par type d’enseignant'
 ])
 
 # ---------- Page 1 ----------
