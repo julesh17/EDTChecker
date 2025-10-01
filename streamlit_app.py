@@ -733,64 +733,108 @@ elif page.startswith('4'):
 elif page.startswith('5'):
     st.header("Récap heures par type d’enseignant")
 
-    # Charger la feuille enseignants
+    # --- trouver la feuille 'Enseignants' (insensible à la casse) ---
+    sheet_candidates = [s for s in xls.sheet_names if 'enseignant' in s.lower()]
+    if not sheet_candidates:
+        st.error("Feuille 'Enseignants' introuvable (attendue: nom de feuille contenant 'Enseignant').")
+        st.stop()
+    ens_sheet = sheet_candidates[0]
+
     try:
-        enseignants_df = pd.read_excel(xls, sheet_name="Enseignants", engine="openpyxl")
+        enseignants_df = pd.read_excel(xls, sheet_name=ens_sheet, engine='openpyxl', header=0)
     except Exception as e:
-        st.error("Impossible de lire la feuille 'Enseignants': " + str(e))
+        st.error(f"Impossible de lire la feuille '{ens_sheet}': {e}")
         st.stop()
 
-    # Normaliser noms enseignants et types
+    # --- détecter colonne 'nom' (préférence sur les noms de colonnes), sinon fallback sur B (index 1) ---
+    cols_lower = [str(c).strip().lower() for c in enseignants_df.columns]
+    name_col = None
+    type_col = None
+    for i, c in enumerate(cols_lower):
+        if any(w in c for w in ['nom', 'name', 'enseignant', 'teacher']):
+            name_col = enseignants_df.columns[i]
+        if any(w in c for w in ['type', 'structure', 'organisation', 'orga', 'affiliation', 'etablissement', 'c']):
+            type_col = enseignants_df.columns[i]
+
+    if name_col is None:
+        name_col = enseignants_df.columns[1] if enseignants_df.shape[1] > 1 else enseignants_df.columns[0]
+    if type_col is None:
+        type_col = enseignants_df.columns[2] if enseignants_df.shape[1] > 2 else enseignants_df.columns[-1]
+
+    # --- construire la map: nom (minuscule, sans espaces superflus) -> type (MAJ) ---
     enseignants_map = {}
     for _, row in enseignants_df.iterrows():
-        nom = str(row.iloc[0]).strip()  # colonne A = nom enseignant
-        type_str = str(row.iloc[2]).strip().upper() if len(row) > 2 else ""
-        if nom and nom.lower() not in ["nan","none"]:
-            enseignants_map[nom] = type_str
+        nom = row.get(name_col)
+        typ = row.get(type_col) if type_col in enseignants_df.columns else None
+        if pd.isna(nom) or str(nom).strip() == '':
+            continue
+        nom_norm = str(nom).strip()
+        typ_norm = str(typ).strip().upper() if (typ is not None and not pd.isna(typ)) else ''
+        enseignants_map[nom_norm.lower()] = typ_norm
 
+    # --- diagnostic utile pour debug ---
+    st.write("Feuille enseignants utilisée :", ens_sheet)
+    st.write("Colonnes détectées -> nom:", str(name_col), ", type:", str(type_col))
+    st.write("Exemples (nom -> type) :", dict(list(enseignants_map.items())[:10]))
+
+    # --- liste des enseignants trouvés dans les événements pour repérer les non-correspondances ---
+    all_teachers = set()
+    for evs in events_by_promo.values():
+        for ev in evs:
+            for t in ev['teachers']:
+                if t and str(t).strip().lower() not in ['nan', 'none']:
+                    all_teachers.add(str(t).strip())
+    missing = [t for t in sorted(all_teachers) if t.lower() not in enseignants_map]
+    st.write(f"Enseignants détectés dans les emplois du temps : {len(all_teachers)}. Non trouvés dans 'enseignants' : {len(missing)}")
+    if missing:
+        st.write(missing[:100])  # affiche jusqu'à 100 pour debug
+
+    # --- classification d'un événement (retourne un set de catégories) ---
     def classify_event(ev):
-        """Retourne le type principal de l'événement"""
         if not ev['teachers']:
-            return "Autonomie"
-        types = []
+            return {'Autonomie'}
+        types = set()
         for t in ev['teachers']:
-            t_norm = str(t).strip()
-            type_str = enseignants_map.get(t_norm, "")
-            if "CESI" in type_str:
-                types.append("CESI")
-            elif "UPS TOULOUSE III" in type_str:
-                types.append("UPS TOULOUSE III")
+            t_norm = str(t).strip().lower()
+            typ = enseignants_map.get(t_norm, '')
+            if 'CESI' in typ:
+                types.add('CESI')
+            elif 'UPS' in typ or 'TOULOUSE' in typ:
+                types.add('UPS TOULOUSE III')
+            elif typ:
+                types.add('Non CESI')
             else:
-                types.append("Non CESI")
-        # Si plusieurs profs, on garde tous (concaténés)
-        return set(types)
+                # si inconnu, on le considère comme Non CESI (ou éventuellement le lister dans "missing" ci-dessus)
+                types.add('Non CESI')
+        return types
 
     def hours(ev):
-        if ev['start'] and ev['end']:
-            return (ev['end'] - ev['start']).total_seconds()/3600.0
-        return 0.0
+        return (ev['end'] - ev['start']).total_seconds() / 3600.0 if ev['start'] and ev['end'] else 0.0
 
-    # Table de résultats
+    # --- calcul par promo ---
     results = []
     for promo, evs in events_by_promo.items():
-        counters = {"Autonomie":0.0, "CESI":0.0, "Non CESI":0.0, "UPS TOULOUSE III":0.0}
+        counters = {'Autonomie': 0.0, 'CESI': 0.0, 'Non CESI': 0.0, 'UPS TOULOUSE III': 0.0}
         for ev in evs:
-            cat = classify_event(ev)
-            if isinstance(cat, str):
-                counters[cat] += hours(ev)
-            else:  # plusieurs types (co-enseignement)
-                h = hours(ev) / len(cat)
-                for c in cat:
-                    counters[c] += h
-        results.append({"Promo": promo, **{k: round(v,2) for k,v in counters.items()}})
+            cats = classify_event(ev)
+            h = hours(ev)
+            if not cats:
+                continue
+            if len(cats) == 1:
+                counters[next(iter(cats))] += h
+            else:
+                # si co-enseignement entre types différents, on répartit l'heure équitablement
+                share = h / len(cats)
+                for c in cats:
+                    counters[c] += share
+        results.append({'Promo': promo, **{k: round(v, 2) for k, v in counters.items()}})
 
-    # Ajout global (toutes promos)
-    total_counters = {"Autonomie":0.0, "CESI":0.0, "Non CESI":0.0, "UPS TOULOUSE III":0.0}
+    # --- total all promos ---
+    total = {'Autonomie': 0.0, 'CESI': 0.0, 'Non CESI': 0.0, 'UPS TOULOUSE III': 0.0}
     for r in results:
-        for k in total_counters:
-            total_counters[k] += r[k]
-    results.append({"Promo": "Toutes promos", **{k: round(v,2) for k,v in total_counters.items()}})
+        for k in total.keys():
+            total[k] += r[k]
+    results.append({'Promo': 'Toutes promos', **{k: round(v, 2) for k, v in total.items()}})
 
-    df_res = pd.DataFrame(results)
-    st.dataframe(df_res)
+    st.dataframe(pd.DataFrame(results))
 
