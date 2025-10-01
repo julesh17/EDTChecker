@@ -706,7 +706,7 @@ elif page.startswith('3'):
                 st.dataframe(df_ev.sort_values('start').reset_index(drop=True))
 
 # ---------- Page 4 ----------
-else:
+elif page.startswith('4'):
     st.header('Récapitulatif textuel complet (par promo)')
     for promo, evs in events_by_promo.items():
         st.subheader(promo)
