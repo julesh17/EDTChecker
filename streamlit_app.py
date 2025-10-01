@@ -731,63 +731,82 @@ elif page.startswith('4'):
 
 # ---------- Page 5 ----------
 elif page.startswith('5'):
-    st.header("Récap heures par type d’enseignant")
+    st.header("Récap heures par type d'enseignant")
 
     # --- trouver la feuille 'Enseignants' (insensible à la casse) ---
     sheet_candidates = [s for s in xls.sheet_names if 'enseignant' in s.lower()]
     if not sheet_candidates:
-        st.error("Feuille 'Enseignants' introuvable (attendue: nom de feuille contenant 'Enseignant').")
+        st.error("Feuille 'Enseignants' introuvable.")
         st.stop()
     ens_sheet = sheet_candidates[0]
 
+    # --- lire SANS header pour éviter que la 1ère ligne soit prise pour des noms de colonnes ---
     try:
-        enseignants_df = pd.read_excel(xls, sheet_name=ens_sheet, engine='openpyxl', header=0)
+        enseignants_df = pd.read_excel(xls, sheet_name=ens_sheet, engine='openpyxl', header=None)
     except Exception as e:
         st.error(f"Impossible de lire la feuille '{ens_sheet}': {e}")
         st.stop()
 
-    # --- détecter colonne 'nom' (préférence sur les noms de colonnes), sinon fallback sur B (index 1) ---
-    cols_lower = [str(c).strip().lower() for c in enseignants_df.columns]
-    name_col = None
-    type_col = None
-    for i, c in enumerate(cols_lower):
-        if any(w in c for w in ['nom', 'name', 'enseignant', 'teacher']):
-            name_col = enseignants_df.columns[i]
-        if any(w in c for w in ['type', 'structure', 'organisation', 'orga', 'affiliation', 'etablissement', 'c']):
-            type_col = enseignants_df.columns[i]
+    # --- préparation : liste des enseignants trouvés dans les emplois du temps ---
+    all_teachers = set()
+    for evs in events_by_promo.values():
+        for ev in evs:
+            for t in ev['teachers']:
+                if t and str(t).strip().lower() not in ['nan','none']:
+                    all_teachers.add(str(t).strip().lower())
 
-    if name_col is None:
-        name_col = enseignants_df.columns[1] if enseignants_df.shape[1] > 1 else enseignants_df.columns[0]
-    if type_col is None:
-        type_col = enseignants_df.columns[2] if enseignants_df.shape[1] > 2 else enseignants_df.columns[-1]
+    # --- heuristiques pour détecter automatiquement colonne "type" et colonne "nom" ---
+    type_keywords = ['CESI', 'UPS', 'TOULOUSE']
+    type_scores = {}
+    for col in enseignants_df.columns:
+        cnt = 0
+        for v in enseignants_df[col].dropna():
+            s = str(v).strip().upper()
+            if any(k in s for k in type_keywords):
+                cnt += 1
+        type_scores[col] = cnt
+    # choisir la colonne ayant le plus de correspondances "CESI"/"UPS"
+    type_col = max(type_scores, key=type_scores.get)
+    if type_scores[type_col] == 0:
+        # fallback : colonne C (index 2) si elle existe, sinon la dernière
+        type_col = 2 if 2 in enseignants_df.columns else enseignants_df.columns[-1]
 
-    # --- construire la map: nom (minuscule, sans espaces superflus) -> type (MAJ) ---
+    # chercher colonne de noms en comparant aux noms déjà trouvés dans les events
+    name_scores = {}
+    for col in enseignants_df.columns:
+        cnt = 0
+        for v in enseignants_df[col].dropna():
+            s = str(v).strip().lower()
+            if s in all_teachers:
+                cnt += 1
+        name_scores[col] = cnt
+    name_col = max(name_scores, key=name_scores.get)
+    if name_scores[name_col] == 0:
+        # fallback : colonne B (index 1) si elle existe, sinon la première
+        name_col = 1 if 1 in enseignants_df.columns else enseignants_df.columns[0]
+
+    # --- construire la map nom -> type (lookup insensible à la casse) ---
     enseignants_map = {}
     for _, row in enseignants_df.iterrows():
         nom = row.get(name_col)
-        typ = row.get(type_col) if type_col in enseignants_df.columns else None
+        typ = row.get(type_col)
         if pd.isna(nom) or str(nom).strip() == '':
             continue
         nom_norm = str(nom).strip()
         typ_norm = str(typ).strip().upper() if (typ is not None and not pd.isna(typ)) else ''
         enseignants_map[nom_norm.lower()] = typ_norm
 
-    # --- diagnostic utile pour debug ---
-    st.write("Feuille enseignants utilisée :", ens_sheet)
-    st.write("Colonnes détectées -> nom:", str(name_col), ", type:", str(type_col))
-    st.write("Exemples (nom -> type) :", dict(list(enseignants_map.items())[:10]))
-
-    # --- liste des enseignants trouvés dans les événements pour repérer les non-correspondances ---
-    all_teachers = set()
-    for evs in events_by_promo.values():
-        for ev in evs:
-            for t in ev['teachers']:
-                if t and str(t).strip().lower() not in ['nan', 'none']:
-                    all_teachers.add(str(t).strip())
-    missing = [t for t in sorted(all_teachers) if t.lower() not in enseignants_map]
-    st.write(f"Enseignants détectés dans les emplois du temps : {len(all_teachers)}. Non trouvés dans 'enseignants' : {len(missing)}")
-    if missing:
-        st.write(missing[:100])  # affiche jusqu'à 100 pour debug
+    # option debug pour afficher les correspondances et les manquants
+    show_debug = st.checkbox("Afficher debug enseignants (colonnes détectées / noms manquants)", value=False)
+    if show_debug:
+        st.write("Feuille utilisée :", ens_sheet)
+        st.write("Shape feuille (lignes,cols) :", enseignants_df.shape)
+        st.write("Colonne nom choisie (index) :", name_col, " — Colonne type choisie (index) :", type_col)
+        st.write("Exemples de mapping (nom -> type) :", dict(list(enseignants_map.items())[:30]))
+        missing = sorted([t for t in all_teachers if t not in enseignants_map])
+        st.write(f"Enseignants détectés dans EDT : {len(all_teachers)}. Non trouvés dans la feuille : {len(missing)}")
+        if missing:
+            st.write(missing)
 
     # --- classification d'un événement (retourne un set de catégories) ---
     def classify_event(ev):
@@ -804,7 +823,7 @@ elif page.startswith('5'):
             elif typ:
                 types.add('Non CESI')
             else:
-                # si inconnu, on le considère comme Non CESI (ou éventuellement le lister dans "missing" ci-dessus)
+                # si inconnu dans la feuille, on le traite comme Non CESI par défaut
                 types.add('Non CESI')
         return types
 
@@ -818,18 +837,16 @@ elif page.startswith('5'):
         for ev in evs:
             cats = classify_event(ev)
             h = hours(ev)
-            if not cats:
-                continue
             if len(cats) == 1:
                 counters[next(iter(cats))] += h
             else:
-                # si co-enseignement entre types différents, on répartit l'heure équitablement
+                # co-enseignement entre types différents -> on répartit équitablement
                 share = h / len(cats)
                 for c in cats:
                     counters[c] += share
         results.append({'Promo': promo, **{k: round(v, 2) for k, v in counters.items()}})
 
-    # --- total all promos ---
+    # total toutes promos
     total = {'Autonomie': 0.0, 'CESI': 0.0, 'Non CESI': 0.0, 'UPS TOULOUSE III': 0.0}
     for r in results:
         for k in total.keys():
@@ -837,4 +854,5 @@ elif page.startswith('5'):
     results.append({'Promo': 'Toutes promos', **{k: round(v, 2) for k, v in total.items()}})
 
     st.dataframe(pd.DataFrame(results))
+
 
