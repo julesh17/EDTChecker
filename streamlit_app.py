@@ -735,9 +735,9 @@ elif page.startswith('5'):
 
     # Charger la feuille enseignants
     try:
-        enseignants_df = pd.read_excel(xls, sheet_name="enseignants", engine="openpyxl")
+        enseignants_df = pd.read_excel(xls, sheet_name="Enseignants", engine="openpyxl")
     except Exception as e:
-        st.error("Impossible de lire la feuille 'enseignants': " + str(e))
+        st.error("Impossible de lire la feuille 'Enseignants': " + str(e))
         st.stop()
 
     # Normaliser noms enseignants et types
