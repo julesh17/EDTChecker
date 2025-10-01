@@ -727,3 +727,69 @@ else:
                     f"- {e['start'].strftime('%Y-%m-%d %H:%M')} → {e['end'].strftime('%H:%M')} "
                     f"— Groupes: {groups} — Enseignant(s): {teachers} {('- '+desc) if desc else ''}"
                 )
+
+# ---------- Page 5 ----------
+elif page.startswith('5'):
+    st.header("Récap heures par type d’enseignant")
+
+    # Charger la feuille enseignants
+    try:
+        enseignants_df = pd.read_excel(xls, sheet_name="enseignants", engine="openpyxl")
+    except Exception as e:
+        st.error("Impossible de lire la feuille 'enseignants': " + str(e))
+        st.stop()
+
+    # Normaliser noms enseignants et types
+    enseignants_map = {}
+    for _, row in enseignants_df.iterrows():
+        nom = str(row.iloc[0]).strip()  # colonne A = nom enseignant
+        type_str = str(row.iloc[2]).strip().upper() if len(row) > 2 else ""
+        if nom and nom.lower() not in ["nan","none"]:
+            enseignants_map[nom] = type_str
+
+    def classify_event(ev):
+        """Retourne le type principal de l'événement"""
+        if not ev['teachers']:
+            return "Autonomie"
+        types = []
+        for t in ev['teachers']:
+            t_norm = str(t).strip()
+            type_str = enseignants_map.get(t_norm, "")
+            if "CESI" in type_str:
+                types.append("CESI")
+            elif "UPS TOULOUSE III" in type_str:
+                types.append("UPS TOULOUSE III")
+            else:
+                types.append("Non CESI")
+        # Si plusieurs profs, on garde tous (concaténés)
+        return set(types)
+
+    def hours(ev):
+        if ev['start'] and ev['end']:
+            return (ev['end'] - ev['start']).total_seconds()/3600.0
+        return 0.0
+
+    # Table de résultats
+    results = []
+    for promo, evs in events_by_promo.items():
+        counters = {"Autonomie":0.0, "CESI":0.0, "Non CESI":0.0, "UPS TOULOUSE III":0.0}
+        for ev in evs:
+            cat = classify_event(ev)
+            if isinstance(cat, str):
+                counters[cat] += hours(ev)
+            else:  # plusieurs types (co-enseignement)
+                h = hours(ev) / len(cat)
+                for c in cat:
+                    counters[c] += h
+        results.append({"Promo": promo, **{k: round(v,2) for k,v in counters.items()}})
+
+    # Ajout global (toutes promos)
+    total_counters = {"Autonomie":0.0, "CESI":0.0, "Non CESI":0.0, "UPS TOULOUSE III":0.0}
+    for r in results:
+        for k in total_counters:
+            total_counters[k] += r[k]
+    results.append({"Promo": "Toutes promos", **{k: round(v,2) for k,v in total_counters.items()}})
+
+    df_res = pd.DataFrame(results)
+    st.dataframe(df_res)
+
